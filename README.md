@@ -4,6 +4,20 @@ Proyecto de procesamiento en streaming end-to-end construido con **Apache Kafka*
 
 ---
 
+---
+
+---
+
+## 👥 Integrantes y Contribuciones
+
+* **Diego Olmedo**
+  * Diseño del contrato de eventos, infraestructura Kafka (Docker) y productor sintético de anomalías.
+  * Desarrollo del pipeline principal en Apache Beam (Event Time, Windows, CombineFn y deduplicación).
+
+* **Nelson Castelvi**
+  * Diseño del contrato de eventos, infraestructura Kafka (Docker) y productor sintético de anomalías.
+  * Implementación de la clave idempotente UPSERT, suite de pruebas unitarias con Pytest y documentación técnica.
+
 ## 🏗️ Arquitectura de la Solución
 
 ```text
@@ -104,3 +118,25 @@ uv run pytest -o pythonpath=. tests/
 1. **Event Time vs Processing Time**: Se extrae `event_time` del payload para evitar sesgos causados por la latencia de red.
 2. **Deduplicación por Ventana**: Implementada en un `CombineFn` personalizado manteniendo un conjunto en memoria de los `event_id` vistos en cada panel de la ventana.
 3. **Estrategia UPSERT (Idempotencia)**: La clave emite la combinación determinista `merchant_id|window_start|window_end`. Cualquier re-procesamiento o actualización por llegada tardía (*late data*) sobreescribe el estado de la ventana en lugar de duplicar resultados.
+
+
+---
+
+## 📸 Evidencia de Pruebas y Ejecución End-to-End
+
+## Evidencia de Ejecución
+![Funcionamiento del Pipeline de Streaming](docs/evidencia.png)
+
+### 1. Ejecución de Pruebas Unitarias Automatizadas
+Validación de la lógica de negocio, deduplicación dentro de la ventana y filtrado de estados de pago mediante `pytest`:
+
+```text
+$ uv run pytest -o pythonpath=. tests/
+============================== test session starts ==============================
+platform darwin -- Python 3.12.x, pytest-9.x.x
+rootdir: /path/to/proyecto
+collected 2 items
+
+tests/test_pipeline.py ..                                                 [100%]
+
+=============================== 2 passed in 1.42s ===============================

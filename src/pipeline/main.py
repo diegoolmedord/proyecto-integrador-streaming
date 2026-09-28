@@ -1,43 +1,62 @@
 import json
 import logging
+import time
 from datetime import datetime
+
 import apache_beam as beam
 from apache_beam.options.pipeline_options import PipelineOptions, StandardOptions
 from apache_beam.transforms.window import FixedWindows, TimestampedValue
-from apache_beam.transforms.trigger import AfterWatermark, AfterCount, AccumulationMode
-from apache_beam.io.kafka import ReadFromKafka, WriteToKafka  # <--- IMPORTACIÓN DIRECTA
+from apache_beam.transforms.trigger import Repeatedly, AfterCount, AccumulationMode
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- 1. PARSEO Y ASIGNACIÓN DE EVENT TIME ---
-class ParseAndTimestampDoFn(beam.DoFn):
-    """
-    Parsea el JSON y asigna el event_time del dominio como timestamp de Beam.
-    Eventos corruptos se ignoran o se envían a un registro de errores.
-    """
+
+# --- 1. LECTOR CONTINUO DE KAFKA ---
+class ReadKafkaContinuous(beam.DoFn):
     def process(self, element):
-        try:
-            # Si el mensaje viene directamente de Kafka o un mock
-            payload_str = element[1].decode('utf-8') if isinstance(element, tuple) else element
-            data = json.loads(payload_str)
-            
-            # Convertir event_time ISO a Unix Timestamp (segundos)
-            dt = datetime.fromisoformat(data["event_time"].replace("Z", "+00:00"))
-            timestamp = dt.timestamp()
-            
-            # Emitir tupla (key, event_data) asociada a su Event Time real
-            yield TimestampedValue((data["key"], data), timestamp)
-        except Exception as e:
-            logging.error(f"Error parseando evento: {e}")
+        from confluent_kafka import Consumer, KafkaError
 
-# --- 2. DEDUPLICACIÓN Y AGREGACIÓN INCREMENTAL ---
+        consumer = Consumer({
+            'bootstrap.servers': 'localhost:9092',
+            'group.id': 'beam-streaming-group-final',
+            'auto.offset.reset': 'latest',
+            'enable.auto.commit': True
+        })
+        consumer.subscribe(['events.v1'])
+        logging.info("🚀 [Beam] Conectado a Kafka. Escuchando eventos en tiempo real...")
+
+        try:
+            while True:
+                msg = consumer.poll(0.5)
+                if msg is None:
+                    continue
+
+                if msg.error():
+                    if msg.error().code() != KafkaError._PARTITION_EOF:
+                        logging.error(f"Error de Kafka: {msg.error()}")
+                    continue
+
+                try:
+                    payload_str = msg.value().decode('utf-8')
+                    data = json.loads(payload_str)
+
+                    # Parsear timestamp del evento
+                    dt = datetime.fromisoformat(data["event_time"].replace("Z", "+00:00"))
+                    timestamp = dt.timestamp()
+
+                    merchant_id = data.get("payload", {}).get("merchant_id", "unknown_merchant")
+
+                    # Emitir el elemento con su marca de tiempo para las ventanas
+                    yield TimestampedValue((merchant_id, data), timestamp)
+                except Exception as e:
+                    logging.error(f"Error procesando mensaje individual: {e}")
+        finally:
+            consumer.close()
+
+
+# --- 2. DEDUPLICACIÓN Y AGREGACIÓN ---
 class AggregatePaymentsFn(beam.CombineFn):
-    """
-    CombineFn personalizado para deduplicar por event_id dentro de la ventana
-    y calcular los totales del comercio.
-    """
     def create_accumulator(self):
-        # Estado inicial del acumulador para una ventana/clave
         return {
             "seen_event_ids": set(),
             "total_amount": 0.0,
@@ -46,19 +65,15 @@ class AggregatePaymentsFn(beam.CombineFn):
         }
 
     def add_input(self, accumulator, input_element):
-        key, event = input_element
-        event_id = event["event_id"]
+        event_id = input_element["event_id"]
 
-        # DEDUPLICACIÓN: Si el event_id ya fue procesado en esta ventana, se ignora
         if event_id in accumulator["seen_event_ids"]:
-            logging.info(f"⚡ DEDUPLICADO FILTRADO EN BEAM: {event_id} para {key}")
+            logging.info(f"⚡ [Deduplicación] Evento duplicado filtrado: {event_id}")
             return accumulator
 
-        # Registrar el ID del evento para no repetirlo
         accumulator["seen_event_ids"].add(event_id)
-        
-        # Agregación de negocio
-        payload = event["payload"]
+
+        payload = input_element.get("payload", {})
         accumulator["count"] += 1
         if payload.get("status") == "CONFIRMED":
             accumulator["total_amount"] += payload.get("amount", 0.0)
@@ -67,12 +82,9 @@ class AggregatePaymentsFn(beam.CombineFn):
         return accumulator
 
     def merge_accumulators(self, accumulators):
-        # Combinar acumuladores parciales (para paralelismo)
         merged = self.create_accumulator()
         for accum in accumulators:
-            for evt_id in accum["seen_event_ids"]:
-                if evt_id not in merged["seen_event_ids"]:
-                    merged["seen_event_ids"].add(evt_id)
+            merged["seen_event_ids"].update(accum["seen_event_ids"])
             merged["count"] += accum["count"]
             merged["confirmed_count"] += accum["confirmed_count"]
             merged["total_amount"] += accum["total_amount"]
@@ -85,74 +97,58 @@ class AggregatePaymentsFn(beam.CombineFn):
             "confirmed_events": accumulator["confirmed_count"]
         }
 
-# --- 3. FORMATO DE SALIDA IDEMPOTENTE (UPSERT) ---
-def format_idempotent_output(element, window=beam.DoFn.WindowParam, pane_info=beam.DoFn.PaneInfoParam):
-    """
-    Estructura el resultado final asignando una clave determinista para garantias de UPSERT.
-    idempotency_key = merchant_id|window_start|window_end
-    """
-    merchant_id, metrics = element
-    
-    start_str = window.start.to_utc_datetime().isoformat()
-    end_str = window.end.to_utc_datetime().isoformat()
-    
-    # Clave de idempotencia única por ventana y entidad
-    idempotency_key = f"{merchant_id}|{start_str}|{end_str}"
-    
-    output_record = {
-        "idempotency_key": idempotency_key,
-        "merchant_id": merchant_id,
-        "window_start": start_str,
-        "window_end": end_str,
-        "pane_index": pane_info.index,
-        "is_final": pane_info.is_last,
-        "metrics": metrics
-    }
-    
-    # Formato para Kafka: Tupla (Key, Value)
-    return (idempotency_key, json.dumps(output_record))
+
+# --- 3. ESCRITOR A KAFKA (SALIDA) ---
+class WriteToKafkaDoFn(beam.DoFn):
+    def setup(self):
+        from confluent_kafka import Producer
+        self.producer = Producer({'bootstrap.servers': 'localhost:9092'})
+
+    def process(self, element, window=beam.DoFn.WindowParam, pane_info=beam.DoFn.PaneInfoParam):
+        merchant_id, metrics = element
+
+        start_str = window.start.to_utc_datetime().isoformat()
+        end_str = window.end.to_utc_datetime().isoformat()
+        idempotency_key = f"{merchant_id}|{start_str}|{end_str}"
+
+        output_record = {
+            "idempotency_key": idempotency_key,
+            "merchant_id": merchant_id,
+            "window_start": start_str,
+            "window_end": end_str,
+            "metrics": metrics
+        }
+
+        self.producer.produce(
+            'aggregates.v1',
+            key=idempotency_key.encode('utf-8'),
+            value=json.dumps(output_record).encode('utf-8')
+        )
+        self.producer.flush()
+        logging.info(f"📤 [Agregación Escrita] {merchant_id} -> Total: ${metrics['total_amount']} ({metrics['total_events']} eventos)")
 
 
+# --- 4. PIPELINE PRINCIPAL ---
 def run():
-    options = PipelineOptions()
+    options = PipelineOptions(["--runner=DirectRunner"])
     options.view_as(StandardOptions).streaming = True
 
     with beam.Pipeline(options=options) as p:
         (
             p
-            # 1. Lectura desde Kafka (Uso directo de ReadFromKafka)
-            | "ReadFromKafka" >> ReadFromKafka(
-                consumer_config={
-                    'bootstrap.servers': 'localhost:9092',
-                    'group.id': 'beam-streaming-group',
-                    'auto.offset.reset': 'latest'
-                },
-                topics=['events.v1']
-            )
-            
-            # 2. Parsear JSON y asignar Event Time real
-            | "ParseAndTimestamp" >> beam.ParDo(ParseAndTimestampDoFn())
-            
-            # 3. Asignar Ventanas Fijas de 60s con Allowed Lateness de 120s
-            | "FixedWindows" >> beam.WindowInto(
+            | "GeneradorInicio" >> beam.Create([1])  # Disparador inicial único que abre el lector infinito
+            | "LeerKafka" >> beam.ParDo(ReadKafkaContinuous())
+            | "VentanasFijas" >> beam.WindowInto(
                 FixedWindows(60),
-                allowed_lateness=120,
-                trigger=AfterWatermark(late=AfterCount(1)),
-                accumulation_mode=AccumulationMode.ACCUMULATING
+                trigger=Repeatedly(AfterCount(1)),
+                accumulation_mode=AccumulationMode.ACCUMULATING,
+                allowed_lateness=86400
             )
-            
-            # 4. Agregación e Inmunización ante Duplicados
-            | "AggregatePayments" >> beam.CombinePerKey(AggregatePaymentsFn())
-            
-            # 5. Formatear con Clave de Idempotencia
-            | "FormatOutput" >> beam.Map(format_idempotent_output)
-            
-            # 6. Escritura a Kafka (Uso directo de WriteToKafka)
-            | "WriteToKafka" >> WriteToKafka(
-                producer_config={'bootstrap.servers': 'localhost:9092'},
-                topic='aggregates.v1'
-            )
+            | "AgruparPorComercio" >> beam.CombinePerKey(AggregatePaymentsFn())
+            | "EscribirKafka" >> beam.ParDo(WriteToKafkaDoFn())
         )
 
+
 if __name__ == '__main__':
+    logging.info("🚀 Iniciando Pipeline de Streaming Apache Beam...")
     run()

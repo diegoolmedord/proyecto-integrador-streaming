@@ -27,17 +27,19 @@ services:
     container_name: init-kafka
     depends_on:
       - kafka
-    entrypoint: [ '/bin/sh', '-c' ]
-    command: >
-      "
-      # Esperar a que Kafka esté listo
-      echo 'Esperando a Kafka...'
-      cub kafka-ready -b kafka:29092 1 30
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Esperando a Kafka..."
+        cub kafka-ready -b kafka:29092 1 30
 
-      # Crear tópicos
-      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic events.v1 --partitions 2 --replication-factor 1
-      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic aggregates.v1 --partitions 2 --replication-factor 1
-      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic events.dlq.v1 --partitions 1 --replication-factor 1
+        echo "Creando tópico events.v1..."
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic events.v1 --partitions 2 --replication-factor 1
 
-      echo 'Tópicos creados exitosamente.'
-      "
+        echo "Creando tópico aggregates.v1..."
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic aggregates.v1 --partitions 2 --replication-factor 1
+
+        echo "Creando tópico events.dlq.v1..."
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic events.dlq.v1 --partitions 1 --replication-factor 1
+
+        echo "Tópicos creados exitosamente."  

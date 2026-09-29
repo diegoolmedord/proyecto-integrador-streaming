@@ -1,5 +1,5 @@
-import pytest
-from src.pipeline.main import AggregatePaymentsFn, ParseAndTimestampDoFn
+from src.pipeline.main import AggregatePaymentsFn
+
 
 def test_deduplication_in_combine_fn():
     """
@@ -11,47 +11,70 @@ def test_deduplication_in_combine_fn():
 
     event_1 = {
         "event_id": "evt_100",
-        "payload": {"amount": 50.0, "status": "CONFIRMED"}
+        "payload": {
+            "amount": 50.0,
+            "status": "CONFIRMED"
+        }
     }
+
     event_duplicate = {
         "event_id": "evt_100",
-        "payload": {"amount": 50.0, "status": "CONFIRMED"}
+        "payload": {
+            "amount": 50.0,
+            "status": "CONFIRMED"
+        }
     }
+
     event_2 = {
         "event_id": "evt_200",
-        "payload": {"amount": 100.0, "status": "CONFIRMED"}
+        "payload": {
+            "amount": 100.0,
+            "status": "CONFIRMED"
+        }
     }
 
     # Procesar primer evento
-    accum = fn.add_input(accum, ("merchant_alpha", event_1))
-    assert accum["count"] == 1
-    assert accum["total_amount"] == 50.0
+    accum = fn.add_input(accum, event_1)
 
-    # Procesar duplicado (debe ser ignorado)
-    accum = fn.add_input(accum, ("merchant_alpha", event_duplicate))
-    assert accum["count"] == 1
-    assert accum["total_amount"] == 50.0  # No cambió el monto
+    assert len(accum["events"]) == 1
 
-    # Procesar evento legítimo distinto
-    accum = fn.add_input(accum, ("merchant_alpha", event_2))
-    assert accum["count"] == 2
-    assert accum["total_amount"] == 150.0
+    # Procesar duplicado
+    accum = fn.add_input(accum, event_duplicate)
+
+    # El duplicado no debe agregarse
+    assert len(accum["events"]) == 1
+
+    # Procesar segundo evento válido
+    accum = fn.add_input(accum, event_2)
+
+    assert len(accum["events"]) == 2
+
+    # Verificar resultado de la agregación
+    output = fn.extract_output(accum)
+
+    assert output["total_events"] == 2
+    assert output["confirmed_events"] == 2
+    assert output["total_amount"] == 150.0
 
 
 def test_rejected_status_not_summed():
     """
-    Verifica que eventos con estado REJECTED incrementen el conteo general
-    pero no sumen al total monetario.
+    Verifica que los eventos REJECTED incrementen
+    el conteo general pero no el monto total.
     """
     fn = AggregatePaymentsFn()
     accum = fn.create_accumulator()
 
     event_rejected = {
         "event_id": "evt_300",
-        "payload": {"amount": 200.0, "status": "REJECTED"}
+        "payload": {
+            "amount": 200.0,
+            "status": "REJECTED"
+        }
     }
 
-    accum = fn.add_input(accum, ("merchant_beta", event_rejected))
+    accum = fn.add_input(accum, event_rejected)
+
     output = fn.extract_output(accum)
 
     assert output["total_events"] == 1
